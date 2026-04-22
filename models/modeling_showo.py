@@ -15,10 +15,12 @@
 
 import torch
 import torch.nn.functional as F
+from torch import Tensor, nn
 from transformers import AutoConfig
 from .modeling_utils import ConfigMixin, ModelMixin, register_to_config
 from .sampling import cosine_schedule, mask_by_random_topk
 from .phi import PhiForCausalLM
+import math
 
 class Showo(ModelMixin, ConfigMixin):
     _supports_gradient_checkpointing = True
@@ -43,9 +45,18 @@ class Showo(ModelMixin, ConfigMixin):
             config = AutoConfig.from_pretrained(llm_model_path)
             self.showo = PhiForCausalLM(config)
         else:
-            self.showo = PhiForCausalLM.from_pretrained(llm_model_path, attn_implementation='sdpa')
+            # Keep compatibility with torch<2.1.1 where transformers may reject SDPA.
+            try:
+                self.showo = PhiForCausalLM.from_pretrained(llm_model_path, attn_implementation='sdpa')
+            except (ImportError, ValueError):
+                self.showo = PhiForCausalLM.from_pretrained(llm_model_path)
         self.showo.resize_token_embeddings(self.vocab_size)
         self.output_size = self.vocab_size
+
+        self.proj1 = nn.Linear(self.output_size, self.output_size, bias=False)
+        self.proj2 = nn.Linear(1024, self.output_size, bias=False)
+        num_heads = 1
+        self.self_attn = Attention(self.output_size, num_heads)
 
         if self.w_clip_vit:
             self.mm_projector = torch.nn.Sequential(
@@ -60,6 +71,7 @@ class Showo(ModelMixin, ConfigMixin):
     def forward(
             self,
             input_ids,
+            image_tokens=None,
             input_embeddings=None,
             attention_mask=None,
             labels=None,
@@ -77,6 +89,22 @@ class Showo(ModelMixin, ConfigMixin):
             logits = self.showo(input_ids=input_ids, attention_mask=attention_mask)['logits']
         else:
             logits = self.showo(inputs_embeds=input_embeddings, attention_mask=attention_mask)['logits']
+
+        if image_tokens is not None:
+            hidden_states = logits
+            h_edit = self.proj1(hidden_states.to(torch.bfloat16))
+            v = image_tokens
+            visual_feature = v.unsqueeze(1).repeat(1, hidden_states.shape[1], 1).to(torch.bfloat16)
+            visual_feature = self.proj2(visual_feature)
+            h_edit = self.self_attn(h_edit, visual_feature, visual_feature)
+            h_edit = h_edit + hidden_states
+
+            h_reason = nn.AdaptiveAvgPool2d((1155, 1))(visual_feature)
+            v_global = nn.AdaptiveAvgPool2d((1155, 1))(visual_feature)
+            h_reason = self.self_attn(v_global, h_reason, h_reason)
+            h_reason = h_reason + hidden_states
+
+            logits = h_edit + h_reason
 
         if labels is not None:
             # 1. Mask token prediction (discrete diffusion) for image generation
@@ -134,18 +162,27 @@ class Showo(ModelMixin, ConfigMixin):
         if uncond_input_ids is not None:
             uncond_prefix = uncond_input_ids[:, :config.dataset.preprocessing.max_seq_length + 1]
 
+        image_tokens = kwargs.get("image_tokens", None)
+
         for step in range(timesteps):
             if uncond_input_ids is not None and guidance_scale > 0:
                 uncond_input_ids = torch.cat(
                     [uncond_prefix, input_ids[:, config.dataset.preprocessing.max_seq_length + 1:]], dim=1)
                 model_input = torch.cat([input_ids, uncond_input_ids])
-                cond_logits, uncond_logits = self(model_input, attention_mask=attention_mask).chunk(2)
+                model_image_tokens = None
+                if image_tokens is not None:
+                    model_image_tokens = torch.cat([image_tokens, image_tokens], dim=0)
+                cond_logits, uncond_logits = self(
+                    model_input,
+                    attention_mask=attention_mask,
+                    image_tokens=model_image_tokens,
+                ).chunk(2)
                 # logits = uncond_logits + guidance_scale * (cond_logits - uncond_logits)
                 # it seems that muse has a different cfg setting
                 logits = (1 + guidance_scale) * cond_logits - guidance_scale * uncond_logits
                 logits = logits[:, -(num_vq_tokens + 1):-1, config.model.showo.llm_vocab_size + num_new_special_tokens:-1]
             else:
-                logits = self(input_ids, attention_mask=attention_mask)
+                logits = self(input_ids, attention_mask=attention_mask, image_tokens=image_tokens)
                 logits = logits[:, -(num_vq_tokens + 1):-1, config.model.showo.llm_vocab_size + num_new_special_tokens:-1]
 
             probs = logits.softmax(dim=-1)
@@ -253,3 +290,43 @@ class Showo(ModelMixin, ConfigMixin):
                 break
 
         return result
+
+
+class Attention(nn.Module):
+    """Simple multi-head attention over already projected q/k/v tensors."""
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_heads: int,
+        downsample_rate: int = 1,
+    ) -> None:
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.internal_dim = embedding_dim // downsample_rate
+        self.num_heads = num_heads
+        assert (self.internal_dim % num_heads == 0), "num_heads must divide embedding_dim."
+
+    def _separate_heads(self, x: Tensor, num_heads: int) -> Tensor:
+        b, n, c = x.shape
+        x = x.reshape(b, n, num_heads, c // num_heads)
+        return x.transpose(1, 2)  # B x N_heads x N_tokens x C_per_head
+
+    def _recombine_heads(self, x: Tensor) -> Tensor:
+        b, n_heads, n_tokens, c_per_head = x.shape
+        x = x.transpose(1, 2)
+        return x.reshape(b, n_tokens, n_heads * c_per_head)  # B x N_tokens x C
+
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+        q = self._separate_heads(q, self.num_heads)
+        k = self._separate_heads(k, self.num_heads)
+        v = self._separate_heads(v, self.num_heads)
+
+        _, _, _, c_per_head = q.shape
+        attn = q @ k.permute(0, 1, 3, 2)
+        attn = attn / math.sqrt(c_per_head)
+        attn = torch.softmax(attn, dim=-1)
+
+        out = attn @ v
+        out = self._recombine_heads(out)
+        return out
