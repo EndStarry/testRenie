@@ -3,7 +3,7 @@
 import os
 import sys
 # script_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append("/opt/data/private/helingfeng/RIE/Show-o-main")
+sys.path.append("/opt/data/private/R-Genie-public")
 # sys.path.append('/root/miniconda3/envs/RIE/lib/python3.10/site-packages/')
 # print(sys.executable)
 # print("Current Working Directory:", os.getcwd())
@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from models import Showo, MAGVITv2, get_mask_chedule, RGenieModel
+from models import Showo, MAGVITv2, get_mask_chedule
 from models.sampling import cosine_schedule, mask_by_random_topk
 from training.edit_dataset import EditingDataset, AverageMeter, ProgressMeter
 from training.utils import get_config
@@ -67,9 +67,23 @@ def main():
     # vq_model.train()
     # vq_model.requires_grad_(True)
 
-    # model = Showo.from_pretrained(config.model.showo.pretrained_model_path).to(device)
-    model = RGenieModel.from_pretrained(config.model.RGenie.pretrained_model_path).to(device)
-    # model = RGenieModel(config).to(device)
+    model, loading_info = Showo.from_pretrained(
+        config.model.showo.pretrained_model_path,
+        low_cpu_mem_usage=False,
+        device_map=None,
+        output_loading_info=True,
+    )
+    model = model.to(device)
+    if config.training.local_rank == 0:
+        missing_keys = loading_info.get("missing_keys", [])
+        unexpected_keys = loading_info.get("unexpected_keys", [])
+        mismatched_keys = loading_info.get("mismatched_keys", [])
+        if missing_keys:
+            print(f"[Showo load] missing_keys: {missing_keys}")
+        if unexpected_keys:
+            print(f"[Showo load] unexpected_keys: {unexpected_keys}")
+        if mismatched_keys:
+            print(f"[Showo load] mismatched_keys: {mismatched_keys}")
 
     # model.eval()
     # print(model)
@@ -94,6 +108,10 @@ def main():
 
         lora_alpha = config.training.lora_alpha
         lora_dropout = config.training.lora_dropout
+        extra_trainable_modules = [
+            module_name.strip() for module_name in config.training.get("extra_trainable_modules", "").split(",")
+            if module_name.strip()
+        ]
         lora_target_modules = find_linear_layers(
             model, config.training.lora_target_modules.split(",")
         )
@@ -104,13 +122,14 @@ def main():
             target_modules=lora_target_modules,
             lora_dropout=lora_dropout,
             bias="none",
+            modules_to_save=extra_trainable_modules if extra_trainable_modules else None,
             # task_type="CAUSAL_LM",
         )
         model = get_peft_model(model, lora_config)
 
         for name, param in model.named_parameters():
             # print(f"Parameter: {name}, Requires Grad: {param.requires_grad}")
-            if 'lora' not in name:
+            if 'lora' not in name and not any(extra_name in name for extra_name in extra_trainable_modules):
                 param.requires_grad = False
         model.print_trainable_parameters()
 
