@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
@@ -52,11 +53,15 @@ class Showo(ModelMixin, ConfigMixin):
                 self.showo = PhiForCausalLM.from_pretrained(llm_model_path)
         self.showo.resize_token_embeddings(self.vocab_size)
         self.output_size = self.vocab_size
+        self.hidden_size = self.showo.config.hidden_size
 
-        self.proj1 = nn.Linear(self.output_size, self.output_size, bias=False)
-        self.proj2 = nn.Linear(1024, self.output_size, bias=False)
-        num_heads = 1
-        self.self_attn = Attention(self.output_size, num_heads)
+        # Keep the bridge design but operate in hidden space instead of vocab space.
+        # This dramatically lowers memory while preserving the same high-level method:
+        # visual-conditioned editing + reasoning branches, then decode to logits.
+        self.proj1 = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.proj2 = nn.Linear(1024, self.hidden_size, bias=False)
+        num_heads = 8 if self.hidden_size % 8 == 0 else 1
+        self.self_attn = Attention(self.hidden_size, num_heads)
 
         if self.w_clip_vit:
             self.mm_projector = torch.nn.Sequential(
@@ -85,26 +90,48 @@ class Showo(ModelMixin, ConfigMixin):
             **kwargs,
     ):
 
-        if input_embeddings is None:
-            logits = self.showo(input_ids=input_ids, attention_mask=attention_mask)['logits']
+        if image_tokens is None:
+            if input_embeddings is None:
+                logits = self.showo(input_ids=input_ids, attention_mask=attention_mask, return_dict=True).logits
+            else:
+                logits = self.showo(
+                    inputs_embeds=input_embeddings,
+                    attention_mask=attention_mask,
+                    return_dict=True,
+                ).logits
         else:
-            logits = self.showo(inputs_embeds=input_embeddings, attention_mask=attention_mask)['logits']
+            if input_embeddings is None:
+                model_outputs = self.showo(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+            else:
+                model_outputs = self.showo(
+                    inputs_embeds=input_embeddings,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+            hidden_states = model_outputs.hidden_states[-1]
+            logits = model_outputs.logits
 
         if image_tokens is not None:
-            hidden_states = logits
-            h_edit = self.proj1(hidden_states.to(torch.bfloat16))
-            v = image_tokens
-            visual_feature = v.unsqueeze(1).repeat(1, hidden_states.shape[1], 1).to(torch.bfloat16)
-            visual_feature = self.proj2(visual_feature)
+            work_dtype = hidden_states.dtype
+            h_edit = self.proj1(hidden_states.to(work_dtype))
+            v = image_tokens.to(hidden_states.dtype)
+            visual_feature = self.proj2(v).unsqueeze(1).expand(-1, hidden_states.shape[1], -1).to(work_dtype)
             h_edit = self.self_attn(h_edit, visual_feature, visual_feature)
             h_edit = h_edit + hidden_states
 
-            h_reason = nn.AdaptiveAvgPool2d((1155, 1))(visual_feature)
-            v_global = nn.AdaptiveAvgPool2d((1155, 1))(visual_feature)
+            v_global = visual_feature.mean(dim=1, keepdim=True).expand(-1, hidden_states.shape[1], -1)
+            h_reason = h_edit
             h_reason = self.self_attn(v_global, h_reason, h_reason)
             h_reason = h_reason + hidden_states
 
-            logits = h_edit + h_reason
+            fused_hidden = h_edit + h_reason
+            logits = self.showo.lm_head(fused_hidden.to(self.showo.lm_head.weight.dtype))
 
         if labels is not None:
             # 1. Mask token prediction (discrete diffusion) for image generation
