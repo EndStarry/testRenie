@@ -10,14 +10,14 @@ experiment:
 
 model:
     RGenie:
-        pretrained_model_path: "./hf_model/R-Genie"
-        model_path_for_inference: "./runs/RGenie-edit/ckpt_model"
+        pretrained_model_path: "./runs/showo-edit/ckpt_model" # "./hf_model/R-Genie"
+        model_path_for_inference: "./runs/showo-edit/ckpt_model"
     vq_model:
         type: "magvitv2"
         vq_model_name: "./hf_model/magvitv2"
 
     showo:
-        pretrained_model_path: "./hf_model/show-o"
+        pretrained_model_path: "./hf_model/show-o" # "./hf_model/showo"
         model_path_for_inference: "./runs/showo-edit/ckpt_model"
         w_clip_vit: False
         vocab_size: 58498
@@ -56,20 +56,21 @@ training:
     lora_r: 8
     lora_alpha: 16
     lora_dropout: 0.1
-    gradient_accumulation_steps: 10
+    gradient_accumulation_steps: 10 #10
     guidance_scale: 0.0
     generation_timesteps: 12
     generation_temperature: 1.0
     lora_target_modules: "q_proj,v_proj"
-    lr: 0.003
+    extra_trainable_modules: "proj2"
+    lr: 0.003 #0.003
     beta1: 0.9
     beta2: 0.95
-    epochs: 1 #30
+    epochs: 10 #30
     precision: "bf16"
 
 merge_lora_weight:
-    weight: "./runs/showo-edit/pytorch_model.bin/pytorch_model.bin"
-    save_path: "./runs/showo-edit/ckpt_model"        
+    weight: "./runs/RGenie_training/pytorch_model.bin"
+    save_path: "./runs/showo-edit/ckpt_model/base"        
 
 testing:
     test_data_path: "./data"
